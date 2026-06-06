@@ -61,7 +61,7 @@ pip install torch transformers pandas openpyxl scikit-learn scipy
 
 ### Step 1: Prepare Your Data
 
-Steps to be specified soon...
+The train and dev sets are provided under task1.1_data and task1.2_data as excel sheets. Convert them to CSV first.
 
 #### Convert to Long Format
 
