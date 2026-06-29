@@ -1,38 +1,45 @@
 """
 train.py
 ────────
-Train CamelBERT / ArBERT / MarBERT / mBERT for hallucination detection.
+Train CamelBERT / ArBERT / MarBERT / mBERT for hallucination detection
+(HalluScoring 2026 — Track 1).
 
-Task 1  →  train on train_long.csv,       validate on dev_long.csv
-Task 2  →  train on train_long.csv,       validate on dev_task2_long.csv
+Data layout (matches the starter kit):
 
-Both tasks use the same training data but different dev sets (different
-models / distributions). Best checkpoint is selected by AUC-ROC on the
-dev set. Models are saved to:
-    outputs/task1/<bert_model>/best_model/
-    outputs/task2/<bert_model>/best_model/
+    <data_dir>/
+    ├── task1.1_data/
+    │   ├── task1.1_train.xlsx
+    │   └── task1.1_dev.xlsx
+    └── task1.2_data/
+        ├── task1.2_train.xlsx
+        └── task1.2_dev.xlsx
+
+The .xlsx files are already in long format with columns:
+    ID | Question | Gold Answer | Generator_model | Generated_answer | Label
+These are mapped internally to: question / model_answer / model_name / label.
+
+Task 1.1  →  train on task1.1_train.xlsx,  validate on task1.1_dev.xlsx
+Task 1.2  →  train on task1.2_train.xlsx,  validate on task1.2_dev.xlsx
+
+Best checkpoint is selected by AUC-ROC on the dev set. Models are saved to:
+    outputs/task1.1/<bert_model>/best_model/
+    outputs/task1.2/<bert_model>/best_model/
 
 Usage
 -----
-# Task 1
-python train.py --task 1 \
-    --train_path train_long.csv \
-    --dev_path   dev_long.csv
+# Both tasks — paths resolved automatically from --data_dir
+python train.py --task 1.1 1.2 --data_dir .
 
-# Task 2
-python train.py --task 2 \
-    --train_path train_long.csv \
-    --dev_path   dev_task2_long.csv
+# Single task
+python train.py --task 1.1 --data_dir .
 
-# Both tasks back-to-back
-python train.py --task 1 2 \
-    --train_path      train_long.csv \
-    --dev_path_task1  dev_long.csv \
-    --dev_path_task2  dev_task2_long.csv
+# Override paths explicitly (single task)
+python train.py --task 1.1 \
+    --train_path task1.1_data/task1.1_train.xlsx \
+    --dev_path   task1.1_data/task1.1_dev.xlsx
 
 # Train only specific BERT models
-python train.py --task 1 --train_path train_long.csv --dev_path dev_long.csv \
-    --models camelbert marbert
+python train.py --task 1.1 --data_dir . --models camelbert marbert
 """
 
 import os
@@ -64,6 +71,19 @@ MODEL_REGISTRY = {
     "arbert":    "UBC-NLP/ARBERT",
     "marbert":   "UBC-NLP/MARBERTv2",
     "mbert":     "google-bert/bert-base-multilingual-cased",
+}
+
+TASKS = ["1.1", "1.2"]
+
+# Map the starter-kit's .xlsx headers → the canonical names used below.
+# (Already-canonical files are passed through unchanged.)
+RAW_TO_CANON = {
+    "Question":         "question",
+    "Generated_answer": "model_answer",
+    "Label":            "label",
+    "Generator_model":  "model_name",
+    "Gold Answer":      "gold_answer",
+    "ID":               "id",
 }
 
 # ──────────────────────────────────────────────────────────
@@ -224,14 +244,61 @@ def train_one(
 # ──────────────────────────────────────────────────────────
 # Data loading
 # ──────────────────────────────────────────────────────────
-def load_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+def load_table(path: str) -> pd.DataFrame:
+    """Read a split, choosing the reader from the file's CONTENT (magic bytes),
+    not its extension — so a mislabeled .csv/.xlsx still loads correctly."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Data file not found: {path}\n"
+            f"Check --data_dir / path flags against the starter-kit layout."
+        )
+    with open(path, "rb") as fh:
+        magic = fh.read(8)
+    if magic[:4] == b"PK\x03\x04":            # .xlsx / .xlsm (a zip archive)
+        return pd.read_excel(path)            # needs `openpyxl`
+    if magic[:4] == b"\xd0\xcf\x11\xe0":      # legacy .xls (OLE2)
+        return pd.read_excel(path)
+    sep = "\t" if path.lower().endswith(".tsv") else ","
+    return pd.read_csv(path, sep=sep)         # text → csv/tsv
+
+
+def normalize_columns(df: pd.DataFrame, path: str = "") -> pd.DataFrame:
+    """Map starter-kit headers to canonical names and require question/answer/label."""
+    df = df.rename(columns={k: v for k, v in RAW_TO_CANON.items() if k in df.columns})
     required = {"question", "model_answer", "label"}
     missing  = required - set(df.columns)
     if missing:
-        raise ValueError(f"Missing columns in {path}: {missing}. Run preprocess.py first.")
+        raise ValueError(
+            f"Missing columns {missing} in {path}.\n"
+            f"Columns found: {list(df.columns)}.\n"
+            f"Expected the starter-kit headers "
+            f"(Question / Generated_answer / Label) or canonical "
+            f"(question / model_answer / label)."
+        )
     df["label"] = df["label"].astype(int)
     return df
+
+
+def load_split(path: str) -> pd.DataFrame:
+    return normalize_columns(load_table(path), path)
+
+
+def default_paths(data_dir: str, task: str):
+    """Resolve default train/dev xlsx paths for a task from the layout."""
+    folder = os.path.join(data_dir, f"task{task}_data")
+    return (os.path.join(folder, f"task{task}_train.xlsx"),
+            os.path.join(folder, f"task{task}_dev.xlsx"))
+
+
+def resolve_task_paths(args, task: str, single_task: bool):
+    d_train, d_dev = default_paths(args.data_dir, task)
+    key            = task.replace(".", "_")               # "1.1" → "1_1"
+    train_override = getattr(args, f"train_path_task{key}")
+    dev_override   = getattr(args, f"dev_path_task{key}")
+    if single_task:                                       # generic flags apply
+        train_override = args.train_path or train_override
+        dev_override   = args.dev_path   or dev_override
+    return (train_override or d_train), (dev_override or d_dev)
 
 
 # ──────────────────────────────────────────────────────────
@@ -259,18 +326,22 @@ def print_summary(task: str, results: dict):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train BERT models for hallucination detection")
 
-    parser.add_argument("--task", nargs="+", choices=["1", "2"], required=True,
-                        help="Which task(s) to train: 1, 2, or both")
-    parser.add_argument("--train_path",      type=str, required=True,
-                        help="Long-format train CSV (shared across tasks)")
+    parser.add_argument("--task", nargs="+", choices=TASKS, required=True,
+                        help="Which task(s) to train: 1.1, 1.2, or both")
+    parser.add_argument("--data_dir", type=str, default=".",
+                        help="Root dir containing task1.1_data/ and task1.2_data/")
 
-    # Dev paths — use --dev_path for a single task, or task-specific flags for both
-    parser.add_argument("--dev_path",        type=str, default=None,
-                        help="Dev CSV when training a single task")
-    parser.add_argument("--dev_path_task1",  type=str, default=None,
-                        help="Dev CSV for Task 1 (when training both tasks)")
-    parser.add_argument("--dev_path_task2",  type=str, default=None,
-                        help="Dev CSV for Task 2 (when training both tasks)")
+    # Generic overrides — for a SINGLE task
+    parser.add_argument("--train_path", type=str, default=None,
+                        help="Train file (overrides --data_dir) when training one task")
+    parser.add_argument("--dev_path",   type=str, default=None,
+                        help="Dev file (overrides --data_dir) when training one task")
+
+    # Task-specific overrides — for BOTH tasks
+    parser.add_argument("--train_path_task1_1", type=str, default=None)
+    parser.add_argument("--dev_path_task1_1",   type=str, default=None)
+    parser.add_argument("--train_path_task1_2", type=str, default=None)
+    parser.add_argument("--dev_path_task1_2",   type=str, default=None)
 
     parser.add_argument("--output_dir",    type=str,   default="./outputs")
     parser.add_argument("--models",        nargs="+",
@@ -291,6 +362,7 @@ def main():
 
     bert_models = list(MODEL_REGISTRY.keys()) if "all" in args.models else args.models
     tasks       = args.task
+    single_task = len(tasks) == 1
 
     # GPU check
     if torch.cuda.is_available():
@@ -299,29 +371,26 @@ def main():
     else:
         print("WARNING: No GPU detected. Training will be slow.\n")
 
-    train_df = load_csv(args.train_path)
-    print(f"Train : {len(train_df)} rows")
-    print(f"Train label dist:\n{train_df['label'].value_counts().to_string()}\n")
+    # ---- Pre-flight: resolve + load every selected split BEFORE any training,
+    #      so a bad path/column in Task 1.2 fails fast instead of after Task 1.1.
+    data = {}
+    for task in tasks:
+        train_path, dev_path = resolve_task_paths(args, task, single_task)
+        train_df = load_split(train_path)
+        dev_df   = load_split(dev_path)
+        data[task] = (train_path, dev_path, train_df, dev_df)
+        print(f"Task {task}")
+        print(f"  Train : {train_path}  ({len(train_df)} rows)  "
+              f"{train_df['label'].value_counts().to_dict()}")
+        print(f"  Dev   : {dev_path}  ({len(dev_df)} rows)  "
+              f"{dev_df['label'].value_counts().to_dict()}")
+    print()
 
-    # Resolve dev paths per task
-    dev_paths = {}
-    if "1" in tasks:
-        p = args.dev_path_task1 or args.dev_path
-        if not p:
-            raise ValueError("Provide --dev_path or --dev_path_task1 for Task 1.")
-        dev_paths["1"] = p
-    if "2" in tasks:
-        p = args.dev_path_task2 or args.dev_path
-        if not p:
-            raise ValueError("Provide --dev_path or --dev_path_task2 for Task 2.")
-        dev_paths["2"] = p
-
-    # Train each task
+    # ---- Train
     all_results = {}
     for task in tasks:
-        dev_df = load_csv(dev_paths[task])
-        print(f"\nTask {task} — Dev : {len(dev_df)} rows")
-        print(f"Dev label dist:\n{dev_df['label'].value_counts().to_string()}\n")
+        train_path, dev_path, train_df, dev_df = data[task]
+        print(f"\n{'#'*65}\n  TASK {task}\n{'#'*65}")
 
         task_results = {}
         for model_key in bert_models:
@@ -344,6 +413,7 @@ def main():
         all_results[task] = task_results
 
     # Save all results
+    os.makedirs(args.output_dir, exist_ok=True)
     results_path = os.path.join(args.output_dir, "all_dev_results.json")
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)

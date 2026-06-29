@@ -1,6 +1,8 @@
 .DS_Store
 preprocess_new.py
 shuffle.py
-raw_data
 fix.py
 make_ref.py
+HS
+raw_data
+temp

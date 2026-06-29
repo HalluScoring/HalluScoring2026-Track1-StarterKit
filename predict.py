@@ -1,31 +1,29 @@
 """
 predict.py
 ──────────
-Run inference on a test set using saved best models from train.py.
+Run inference on a test/dev set using the best models saved by train.py.
 
-If the test file has labels → computes AUC-ROC, F1-Macro, AUC-PR + per-model breakdown.
-If no labels              → saves predictions only.
+If the file has labels → computes AUC-ROC, F1-Macro, AUC-PR + per-generator
+breakdown. If no labels → saves predictions only.
 
-Accepts both:
-  - Wide XLSX  (auto-converts to long internally, no preprocess.py needed)
-  - Long CSV   (already preprocessed)
+Input files use the starter-kit long format (.xlsx) with columns:
+    ID | Question | Gold Answer | Generator_model | Generated_answer | [Label]
+mapped internally to: id / question / gold_answer / model_name / model_answer / label.
+A pre-mapped .csv (question / model_answer / [label] / [model_name]) also works.
 
-Saved model paths are expected as:
-    outputs/task<N>/<bert_model>/best_model/
+Saved model paths are expected at:
+    outputs/task<1.1|1.2>/<bert_model>/best_model/
 
 Usage
 -----
-# Task 1 test (wide XLSX, no labels)
-python predict.py --task 1 --test_path test.xlsx
+# Task 1.1 test (no labels)
+python predict.py --task 1.1 --test_path test_task1.1.xlsx
 
-# Task 2 test (wide XLSX, no labels)
-python predict.py --task 2 --test_path test_task2.xlsx
-
-# Task 2 dev evaluation (wide XLSX, has labels)
-python predict.py --task 2 --test_path dev_task2.xlsx --has_labels
+# Task 1.2 dev evaluation (has labels)
+python predict.py --task 1.2 --test_path task1.2_data/task1.2_dev.xlsx --has_labels
 
 # Specific model only
-python predict.py --task 1 --test_path test.xlsx --models camelbert
+python predict.py --task 1.1 --test_path test.xlsx --models camelbert
 """
 
 import os
@@ -44,53 +42,53 @@ from sklearn.metrics import (
 )
 
 # ──────────────────────────────────────────────────────────
-# Model registry
+# Registry / config
 # ──────────────────────────────────────────────────────────
-MODEL_REGISTRY = {
-    "camelbert": "camelbert",
-    "arbert":    "arbert",
-    "marbert":   "marbert",
-    "mbert":     "mbert",
+MODEL_KEYS = ["camelbert", "arbert", "marbert", "mbert"]
+TASKS      = ["1.1", "1.2"]
+
+# Map starter-kit .xlsx headers → canonical names (already-canonical passes through).
+RAW_TO_CANON = {
+    "Question":         "question",
+    "Generated_answer": "model_answer",
+    "Label":            "label",
+    "Generator_model":  "model_name",
+    "Gold Answer":      "gold_answer",
+    "ID":               "id",
 }
 
-LABEL_SUFFIX = " Factual Hallucination"
-SKIP_COLS    = {"Question", "Answer", "ID"}
-
 # ──────────────────────────────────────────────────────────
-# Wide → long conversion
+# Data loading / normalization
 # ──────────────────────────────────────────────────────────
-def detect_model_columns(df: pd.DataFrame) -> dict:
-    cols = {}
-    for col in df.columns:
-        if col in SKIP_COLS or col.endswith(LABEL_SUFFIX):
-            continue
-        label_col = col + LABEL_SUFFIX
-        # label col may or may not exist (unseen test)
-        cols[col] = (col, label_col if label_col in df.columns else None)
-    if not cols:
-        raise ValueError("No model columns detected in the input file.")
-    return cols
+def load_table(path: str) -> pd.DataFrame:
+    """Choose reader from file CONTENT (magic bytes), not extension."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Test file not found: {path}")
+    with open(path, "rb") as fh:
+        magic = fh.read(8)
+    if magic[:4] == b"PK\x03\x04":            # .xlsx / .xlsm (zip)
+        return pd.read_excel(path)            # needs `openpyxl`
+    if magic[:4] == b"\xd0\xcf\x11\xe0":      # legacy .xls (OLE2)
+        return pd.read_excel(path)
+    sep = "\t" if path.lower().endswith(".tsv") else ","
+    return pd.read_csv(path, sep=sep)
 
 
-def wide_to_long(df: pd.DataFrame) -> tuple:
-    """Returns (long_df, has_labels)."""
-    model_cols = detect_model_columns(df)
-    has_labels = all(lbl is not None for _, lbl in model_cols.values())
-    print(f"  Detected models : {list(model_cols.keys())}")
-    print(f"  Labels present  : {has_labels}")
-
-    rows = []
-    for _, row in df.iterrows():
-        for model_name, (ans_col, lbl_col) in model_cols.items():
-            entry = {
-                "question":     row["Question"],
-                "model_answer": row[ans_col],
-                "model_name":   model_name,
-            }
-            if lbl_col:
-                entry["label"] = int(row[lbl_col])
-            rows.append(entry)
-    return pd.DataFrame(rows), has_labels
+def normalize_columns(df: pd.DataFrame, path: str = "") -> pd.DataFrame:
+    """Require question + model_answer; label/model_name are optional."""
+    df = df.rename(columns={k: v for k, v in RAW_TO_CANON.items() if k in df.columns})
+    required = {"question", "model_answer"}
+    missing  = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Missing columns {missing} in {path}.\n"
+            f"Columns found: {list(df.columns)}.\n"
+            f"Expected starter-kit headers (Question / Generated_answer) "
+            f"or canonical (question / model_answer)."
+        )
+    if "label" in df.columns:
+        df["label"] = df["label"].astype(int)
+    return df
 
 
 # ──────────────────────────────────────────────────────────
@@ -160,7 +158,7 @@ def run_inference(df: pd.DataFrame, model_dir: str,
 # ──────────────────────────────────────────────────────────
 # Evaluation
 # ──────────────────────────────────────────────────────────
-def evaluate(df: pd.DataFrame, model_key: str, task: str):
+def evaluate(df: pd.DataFrame, model_key: str, task: str) -> dict:
     labels = df["label"].values
     probs  = df["prob_hallucinated"].values
     preds  = df["predicted_label"].values
@@ -181,14 +179,18 @@ def evaluate(df: pd.DataFrame, model_key: str, task: str):
         digits=4,
     ))
 
-    # Per-model breakdown
-    print(f"  {'Model':<22} {'AUC-ROC':>10} {'F1-Macro':>10} {'AUC-PR':>10}")
-    print(f"  {'-'*54}")
-    for name, grp in df.groupby("model_name"):
-        r_auc  = roc_auc_score(grp["label"], grp["prob_hallucinated"])
-        r_f1   = f1_score(grp["label"], grp["predicted_label"], average="macro", zero_division=0)
-        r_apr  = average_precision_score(grp["label"], grp["prob_hallucinated"])
-        print(f"  {name:<22} {r_auc:>10.4f} {r_f1:>10.4f} {r_apr:>10.4f}")
+    # Per-generator breakdown (only if model_name present and has >1 class per group)
+    if "model_name" in df.columns:
+        print(f"  {'Generator model':<28} {'AUC-ROC':>10} {'F1-Macro':>10} {'AUC-PR':>10}")
+        print(f"  {'-'*60}")
+        for name, grp in df.groupby("model_name"):
+            y = grp["label"].values
+            p = grp["prob_hallucinated"].values
+            d = grp["predicted_label"].values
+            r_auc = roc_auc_score(y, p) if len(np.unique(y)) > 1 else float("nan")
+            r_apr = average_precision_score(y, p) if len(np.unique(y)) > 1 else float("nan")
+            r_f1  = f1_score(y, d, average="macro", zero_division=0)
+            print(f"  {str(name):<28} {r_auc:>10.4f} {r_f1:>10.4f} {r_apr:>10.4f}")
 
     return {"auc_roc": auc_roc, "f1_macro": f1_macro, "auc_pr": auc_pr}
 
@@ -200,16 +202,15 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Predict hallucination labels using saved best models"
     )
-    parser.add_argument("--task",       type=str, choices=["1", "2"], required=True)
+    parser.add_argument("--task",       type=str, choices=TASKS, required=True)
     parser.add_argument("--test_path",  type=str, required=True,
-                        help="Wide XLSX or long CSV test file")
+                        help="Test/dev file (.xlsx starter-kit format or .csv)")
     parser.add_argument("--output_dir", type=str, default="./outputs",
-                        help="Root dir where task<N>/<model>/best_model/ folders live")
+                        help="Root dir where task<X>/<model>/best_model/ folders live")
     parser.add_argument("--models",     nargs="+",
-                        choices=list(MODEL_REGISTRY.keys()) + ["all"],
-                        default=["all"])
+                        choices=MODEL_KEYS + ["all"], default=["all"])
     parser.add_argument("--has_labels", action="store_true",
-                        help="Set if the test file has label columns (for evaluation)")
+                        help="Force evaluation even if label detection is unsure")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_length", type=int, default=512)
     return parser.parse_args()
@@ -218,25 +219,16 @@ def parse_args():
 def main():
     args = parse_args()
 
-    bert_models = list(MODEL_REGISTRY.keys()) if "all" in args.models else args.models
+    bert_models = MODEL_KEYS if "all" in args.models else args.models
 
-    # Load test file
+    # Load + normalize test file
     print(f"\nLoading test file : {args.test_path}")
-    raw = pd.read_excel(args.test_path) if args.test_path.endswith(".xlsx") \
-          else pd.read_csv(args.test_path)
-
-    # Convert to long if wide
-    if "model_answer" in raw.columns:
-        test_df    = raw.copy()
-        has_labels = "label" in test_df.columns
-        print(f"  Format         : long ({len(test_df)} rows)")
-        print(f"  Labels present : {has_labels}")
-    else:
-        print(f"  Format         : wide ({len(raw)} rows) — converting...")
-        test_df, has_labels = wide_to_long(raw)
-
-    if args.has_labels:
-        has_labels = True
+    test_df    = normalize_columns(load_table(args.test_path), args.test_path)
+    has_labels = ("label" in test_df.columns) or args.has_labels
+    print(f"  Rows           : {len(test_df)}")
+    print(f"  Labels present : {has_labels}")
+    if args.has_labels and "label" not in test_df.columns:
+        raise ValueError("--has_labels set but no Label/label column found.")
 
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     print(f"  Device         : {device_name}")
@@ -256,11 +248,10 @@ def main():
         result_df["prob_hallucinated"] = probs
         result_df["predicted_label"]   = preds
 
-        # Save predictions
-        out_path = os.path.join(
-            args.output_dir, f"task{args.task}",
-            f"predictions_{model_key}.csv"
-        )
+        # Save per-model predictions
+        out_dir = os.path.join(args.output_dir, f"task{args.task}")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"predictions_{model_key}.csv")
         result_df.to_csv(out_path, index=False)
         print(f"  Predictions saved → {out_path}")
 
@@ -283,7 +274,9 @@ def main():
             )
         print(f"{'='*58}")
 
-        results_path = os.path.join(args.output_dir, f"task{args.task}", "test_results.json")
+        out_dir = os.path.join(args.output_dir, f"task{args.task}")
+        os.makedirs(out_dir, exist_ok=True)
+        results_path = os.path.join(out_dir, "test_results.json")
         with open(results_path, "w") as f:
             json.dump(all_results, f, indent=2)
         print(f"\nResults saved → {results_path}")
